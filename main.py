@@ -8,7 +8,7 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 SPORT = "basketball_nba"
-REGION = "us"
+REGION = "au"
 MARKET = "h2h"  # moneyline
 
 intents = discord.Intents.default()
@@ -44,9 +44,12 @@ async def ev_loop():
 
     while True:
         url = (
-            f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds"
-            f"?apiKey={ODDS_API_KEY}&regions={REGION}&markets={MARKET}"
-        )
+    f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds"
+    f"?apiKey={ODDS_API_KEY}"
+    f"&regions={REGION}"
+    f"&markets={MARKET}"
+    f"&oddsFormat=decimal"
+)
 
         response = requests.get(url)
 
