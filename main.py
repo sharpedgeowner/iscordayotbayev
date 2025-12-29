@@ -6,114 +6,125 @@ import requests
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-MIN_EV = float(os.getenv("MIN_EV", 0.02))        # default +2% EV
+
+MIN_EV = float(os.getenv("MIN_EV", 0.02))          # +2% EV
 KELLY_FRAC = float(os.getenv("KELLY_FRACTION", 0.1))
 
-SPORT = "basketball_nba"
-REGIONS = "au,us"
-MARKETS = ["h2h"]  # list so we can expand easily
+# AU ONLY
+REGION = "au"
+MARKET = "h2h"   # moneyline / match winner
+ODDS_FORMAT = "decimal"
+
+# SPORTS TO CHECK
+SPORTS = {
+    "🏈 NFL": "americanfootball_nfl",
+    "🏉 AFL": "aussierules_afl",
+    "🏉 NRL": "rugbyleague_nrl",
+    "⚽ Soccer": "soccer_epl,soccer_uefa_champs_league,soccer_fifa_world_cup"
+}
 
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
-# store last seen odds for line movement
-last_odds = {}
+# Track last odds for line movement + duplicate prevention
+last_seen = {}
 
 def calc_ev(decimal_odds, true_prob):
     return (true_prob * decimal_odds) - 1
 
 def kelly_units(ev, decimal_odds):
-    # Kelly fraction * (bp - q)/b ; simplifed
     b = decimal_odds - 1
-    q = 1 - ev
-    kelly = ((ev * b) - q) / b if b > 0 else 0
-    return max(0, kelly * KELLY_FRAC)
+    if b <= 0:
+        return 0
+    kelly = ev / b
+    return round(max(0, kelly * KELLY_FRAC), 2)
 
-async def check_games(channel):
+async def fetch_sport(channel, emoji, sport_key):
     url = (
-        f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds"
+        f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
         f"?apiKey={ODDS_API_KEY}"
-        f"&regions={REGIONS}"
-        f"&markets={','.join(MARKETS)}"
-        f"&oddsFormat=decimal"
+        f"&regions={REGION}"
+        f"&markets={MARKET}"
+        f"&oddsFormat={ODDS_FORMAT}"
     )
 
-    res = requests.get(url)
-    if res.status_code != 200:
-        print("Odds API error", res.status_code)
+    r = requests.get(url)
+    if r.status_code != 200:
         return
 
-    games = res.json()
+    games = r.json()
 
     for game in games:
-        game_id = game["id"]
         home = game["home_team"]
         away = game["away_team"]
-        bookmakers = game.get("bookmakers", [])
+        books = game.get("bookmakers", [])
 
-        # skip if no multiple books
-        if len(bookmakers) < 2:
+        if len(books) < 2:
             continue
 
-        # identify reference (sharp) as highest available books
-        ref_book = bookmakers[0]
+        # Use best-priced book as fair reference
+        ref_book = max(books, key=lambda b: max(o["price"] for o in b["markets"][0]["outcomes"]))
 
-        for book in bookmakers:
+        for book in books:
             book_name = book["title"]
 
-            for market in book["markets"]:
-                for outcome in market["outcomes"]:
-                    team = outcome["name"]
-                    dec_odds = outcome.get("price")
+            for outcome in book["markets"][0]["outcomes"]:
+                team = outcome["name"]
+                price = outcome["price"]
 
-                    # compute true probability using reference odds
-                    ref_outcome = next(
-                        (o for o in ref_book["markets"][0]["outcomes"] if o["name"] == team),
-                        None
+                ref_outcome = next(
+                    (o for o in ref_book["markets"][0]["outcomes"] if o["name"] == team),
+                    None
+                )
+                if not ref_outcome:
+                    continue
+
+                ref_price = ref_outcome["price"]
+                true_prob = 1 / ref_price
+                ev = calc_ev(price, true_prob)
+
+                key = (sport_key, home, away, book_name, team)
+                prev_price = last_seen.get(key)
+
+                line_move = ""
+                if prev_price and prev_price != price:
+                    line_move = f"\n📈 Line move: {prev_price} → {price}"
+
+                last_seen[key] = price
+
+                if ev >= MIN_EV:
+                    units = kelly_units(ev, price)
+                    if units <= 0:
+                        continue
+
+                    await channel.send(
+                        f"🔥 **+EV BET (AU ONLY)** 🔥\n\n"
+                        f"{emoji} {away} vs {home}\n"
+                        f"📍 Book: {book_name}\n"
+                        f"📌 {team} @ {price}\n"
+                        f"📊 EV: {round(ev * 100, 2)}%\n"
+                        f"📈 Stake: {units} Units"
+                        f"{line_move}"
                     )
-                    if not ref_outcome:
-                        continue
-
-                    ref_dec = ref_outcome.get("price")
-                    if not ref_dec:
-                        continue
-
-                    true_prob = 1 / ref_dec
-                    ev = calc_ev(dec_odds, true_prob)
-
-                    # track odds changes
-                    prev = last_odds.get((game_id, book_name, team))
-                    moved = ""
-                    if prev and prev != dec_odds:
-                        moved = f"📈 *Line moved: {prev} → {dec_odds}*"
-
-                    # save current odds
-                    last_odds[(game_id, book_name, team)] = dec_odds
-
-                    # only alert if EV ≥ threshold
-                    if ev >= MIN_EV:
-                        units = round(kelly_units(ev, dec_odds), 2)
-                        if units > 0:
-                            await channel.send(
-                                f"🔥 **+EV ALERT** 🔥\n"
-                                f"🏀 {away} vs {home}\n"
-                                f"📍 Book: {book_name}\n"
-                                f"📌 {team} ML @ {dec_odds}\n"
-                                f"📊 EV: {round(ev*100,2)}%\n"
-                                f"📈 Kelly Units: {units}\n"
-                                f"{moved}"
-                            )
 
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user}")
-    client.loop.create_task(ev_loop())
+    client.loop.create_task(main_loop())
 
-async def ev_loop():
+async def main_loop():
     await client.wait_until_ready()
     channel = client.get_channel(CHANNEL_ID)
+
     while True:
-        await check_games(channel)
-        await asyncio.sleep(900)  # 15 min
+        for emoji, sport in SPORTS.items():
+            # soccer may contain multiple leagues
+            if "," in sport:
+                for s in sport.split(","):
+                    await fetch_sport(channel, emoji, s)
+            else:
+                await fetch_sport(channel, emoji, sport)
+
+        await asyncio.sleep(900)  # 15 minutes (API safe)
 
 client.run(TOKEN)
