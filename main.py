@@ -2,129 +2,169 @@ import discord
 import os
 import asyncio
 import requests
+from datetime import datetime, timezone, timedelta
 
+# ===== ENV VARS =====
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
-MIN_EV = float(os.getenv("MIN_EV", 0.02))          # +2% EV
-KELLY_FRAC = float(os.getenv("KELLY_FRACTION", 0.1))
-
-# AU ONLY
+# ===== CONFIG =====
 REGION = "au"
-MARKET = "h2h"   # moneyline / match winner
 ODDS_FORMAT = "decimal"
+MIN_EV = 0.03           # +3% minimum
+MAJOR_EV = 0.08         # overrides kickoff window
+MAX_HOURS_TO_START = 24
+CHECK_INTERVAL = 900    # 15 minutes
 
-# SPORTS TO CHECK
 SPORTS = {
-    "🏈 NFL": "americanfootball_nfl",
-    "🏉 AFL": "aussierules_afl",
-    "🏉 NRL": "rugbyleague_nrl",
-    "⚽ Soccer": "soccer_epl,soccer_uefa_champs_league,soccer_fifa_world_cup"
+    "americanfootball_nfl": "🏈 NFL",
+    "australianfootball_afl": "🏉 AFL",
+    "rugbyleague_nrl": "🏉 NRL",
+    "soccer_epl": "⚽ Soccer",
+    "soccer_uefa_champs_league": "⚽ Soccer"
 }
 
+# ===== DISCORD =====
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
-# Track last odds for line movement + duplicate prevention
-last_seen = {}
+# ===== MEMORY (ANTI-SPAM) =====
+posted_bets = set()
 
+# ===== HELPERS =====
 def calc_ev(decimal_odds, true_prob):
     return (true_prob * decimal_odds) - 1
 
-def kelly_units(ev, decimal_odds):
-    b = decimal_odds - 1
-    if b <= 0:
-        return 0
-    kelly = ev / b
-    return round(max(0, kelly * KELLY_FRAC), 2)
+def staking_units(ev):
+    # Fewer bets, higher conviction
+    if ev >= 0.12:
+        return 3.0
+    elif ev >= 0.08:
+        return 2.0
+    elif ev >= 0.05:
+        return 1.0
+    elif ev >= 0.03:
+        return 0.5
+    return 0
 
-async def fetch_sport(channel, emoji, sport_key):
+def hours_until_start(commence_time):
+    start = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
+    now = datetime.now(timezone.utc)
+    return (start - now).total_seconds() / 3600
+
+# ===== CORE LOGIC =====
+async def check_sport(channel, sport_key, sport_name):
     url = (
         f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
         f"?apiKey={ODDS_API_KEY}"
         f"&regions={REGION}"
-        f"&markets={MARKET}"
+        f"&markets=h2h"
         f"&oddsFormat={ODDS_FORMAT}"
     )
 
-    r = requests.get(url)
-    if r.status_code != 200:
+    res = requests.get(url)
+    if res.status_code != 200:
         return
 
-    games = r.json()
+    games = res.json()
 
     for game in games:
+        game_id = game["id"]
         home = game["home_team"]
         away = game["away_team"]
-        books = game.get("bookmakers", [])
+        hrs_to_start = hours_until_start(game["commence_time"])
 
+        books = game.get("bookmakers", [])
         if len(books) < 2:
             continue
 
-        # Use best-priced book as fair reference
-        ref_book = max(books, key=lambda b: max(o["price"] for o in b["markets"][0]["outcomes"]))
+        for outcome_idx in [0, 1]:
+            team = books[0]["markets"][0]["outcomes"][outcome_idx]["name"]
 
-        for book in books:
-            book_name = book["title"]
+            # ===== FIND TRUE ODDS (BEST AVG PROXY) =====
+            ref_prices = []
+            for b in books:
+                try:
+                    ref_prices.append(
+                        b["markets"][0]["outcomes"][outcome_idx]["price"]
+                    )
+                except:
+                    pass
 
-            for outcome in book["markets"][0]["outcomes"]:
-                team = outcome["name"]
-                price = outcome["price"]
+            if len(ref_prices) < 2:
+                continue
 
-                ref_outcome = next(
-                    (o for o in ref_book["markets"][0]["outcomes"] if o["name"] == team),
-                    None
-                )
-                if not ref_outcome:
+            true_prob = sum(1 / p for p in ref_prices) / len(ref_prices)
+
+            # ===== FIND BEST BOOK =====
+            best_price = 0
+            best_book = None
+            supplementary = []
+
+            for b in books:
+                try:
+                    price = b["markets"][0]["outcomes"][outcome_idx]["price"]
+                    if price > best_price:
+                        if best_book:
+                            supplementary.append((best_book["title"], best_price))
+                        best_price = price
+                        best_book = b
+                    else:
+                        supplementary.append((b["title"], price))
+                except:
                     continue
 
-                ref_price = ref_outcome["price"]
-                true_prob = 1 / ref_price
-                ev = calc_ev(price, true_prob)
+            ev = calc_ev(best_price, true_prob)
+            units = staking_units(ev)
 
-                key = (sport_key, home, away, book_name, team)
-                prev_price = last_seen.get(key)
+            # ===== FILTERS =====
+            if ev < MIN_EV:
+                continue
 
-                line_move = ""
-                if prev_price and prev_price != price:
-                    line_move = f"\n📈 Line move: {prev_price} → {price}"
+            if hrs_to_start > MAX_HOURS_TO_START and ev < MAJOR_EV:
+                continue
 
-                last_seen[key] = price
+            bet_key = f"{game_id}-{team}"
+            if bet_key in posted_bets:
+                continue
 
-                if ev >= MIN_EV:
-                    units = kelly_units(ev, price)
-                    if units <= 0:
-                        continue
+            if units <= 0:
+                continue
 
-                    await channel.send(
-                        f"🔥 **+EV BET (AU ONLY)** 🔥\n\n"
-                        f"{emoji} {away} vs {home}\n"
-                        f"📍 Book: {book_name}\n"
-                        f"📌 {team} @ {price}\n"
-                        f"📊 EV: {round(ev * 100, 2)}%\n"
-                        f"📈 Stake: {units} Units"
-                        f"{line_move}"
-                    )
+            posted_bets.add(bet_key)
 
-@client.event
-async def on_ready():
-    print(f"Logged in as {client.user}")
-    client.loop.create_task(main_loop())
+            # ===== FORMAT MESSAGE =====
+            sup_text = ""
+            for book, price in sorted(supplementary, key=lambda x: -x[1])[:4]:
+                sup_text += f"• {book}: {price}\n"
 
-async def main_loop():
+            msg = (
+                f"🔥 **+EV BET** 🔥\n\n"
+                f"{sport_name}\n"
+                f"🆚 {away} vs {home}\n"
+                f"📌 **{team} ML**\n\n"
+                f"🏆 **Best Odds:** {best_price} ({best_book['title']})\n"
+                f"📊 **EV:** {round(ev*100,2)}%\n"
+                f"📈 **Stake:** {units} units\n"
+                f"⏱ Starts in: {round(hrs_to_start,1)}h\n\n"
+                f"📚 **Other Books:**\n{sup_text}"
+            )
+
+            await channel.send(msg)
+
+async def ev_loop():
     await client.wait_until_ready()
     channel = client.get_channel(CHANNEL_ID)
 
     while True:
-        for emoji, sport in SPORTS.items():
-            # soccer may contain multiple leagues
-            if "," in sport:
-                for s in sport.split(","):
-                    await fetch_sport(channel, emoji, s)
-            else:
-                await fetch_sport(channel, emoji, sport)
+        for sport_key, sport_name in SPORTS.items():
+            await check_sport(channel, sport_key, sport_name)
+        await asyncio.sleep(CHECK_INTERVAL)
 
-        await asyncio.sleep(900)  # 15 minutes (API safe)
+@client.event
+async def on_ready():
+    print(f"Logged in as {client.user}")
+    client.loop.create_task(ev_loop())
 
 client.run(TOKEN)
