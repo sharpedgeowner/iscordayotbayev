@@ -13,6 +13,7 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 REGION = "au"
 ODDS_FORMAT = "decimal"
 MIN_EV = 0.03           # +3% minimum
+MAX_EV = 0.10           # cap EV at 10%
 MAJOR_EV = 0.08         # overrides kickoff window
 MAX_HOURS_TO_START = 24
 CHECK_INTERVAL = 900    # 15 minutes
@@ -29,24 +30,24 @@ SPORTS = {
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
-# ===== MEMORY (ANTI-SPAM) =====
+# ===== MEMORY (ANTI-SPAM + LINE MOVEMENT) =====
 posted_bets = set()
+last_odds = {}  # key: game-team-book, value: last seen odds
 
 # ===== HELPERS =====
 def calc_ev(decimal_odds, true_prob):
-    return (true_prob * decimal_odds) - 1
+    ev = (true_prob * decimal_odds) - 1
+    return min(ev, MAX_EV)  # cap EV at 10%
 
 def staking_units(ev):
     # Fewer bets, higher conviction
-    if ev >= 0.12:
+    if ev >= 0.08:
         return 3.0
-    elif ev >= 0.08:
+    elif ev >= 0.06:
         return 2.0
-    elif ev >= 0.05:
+    elif ev >= 0.04:
         return 1.0
-    elif ev >= 0.03:
-        return 0.5
-    return 0
+    return 0.5  # minimum stake
 
 def hours_until_start(commence_time):
     start = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
@@ -65,6 +66,7 @@ async def check_sport(channel, sport_key, sport_name):
 
     res = requests.get(url)
     if res.status_code != 200:
+        print(f"Odds API error for {sport_name}: {res.status_code}")
         return
 
     games = res.json()
@@ -82,13 +84,11 @@ async def check_sport(channel, sport_key, sport_name):
         for outcome_idx in [0, 1]:
             team = books[0]["markets"][0]["outcomes"][outcome_idx]["name"]
 
-            # ===== FIND TRUE ODDS (BEST AVG PROXY) =====
+            # ===== TRUE ODDS (AVG PROXY) =====
             ref_prices = []
             for b in books:
                 try:
-                    ref_prices.append(
-                        b["markets"][0]["outcomes"][outcome_idx]["price"]
-                    )
+                    ref_prices.append(b["markets"][0]["outcomes"][outcome_idx]["price"])
                 except:
                     pass
 
@@ -97,14 +97,25 @@ async def check_sport(channel, sport_key, sport_name):
 
             true_prob = sum(1 / p for p in ref_prices) / len(ref_prices)
 
-            # ===== FIND BEST BOOK =====
+            # ===== BEST BOOK + LINE MOVEMENT =====
             best_price = 0
             best_book = None
             supplementary = []
+            line_movement_note = ""
 
             for b in books:
                 try:
                     price = b["markets"][0]["outcomes"][outcome_idx]["price"]
+                    key = f"{game_id}-{team}-{b['title']}"
+
+                    # Detect line movement
+                    prev_price = last_odds.get(key)
+                    if prev_price and prev_price != price:
+                        line_movement_note += f"📈 {b['title']} moved: {prev_price} → {price}\n"
+
+                    last_odds[key] = price  # update last seen
+
+                    # Determine best odds
                     if price > best_price:
                         if best_book:
                             supplementary.append((best_book["title"], best_price))
@@ -116,9 +127,6 @@ async def check_sport(channel, sport_key, sport_name):
                     continue
 
             ev = calc_ev(best_price, true_prob)
-            units = staking_units(ev)
-
-            # ===== FILTERS =====
             if ev < MIN_EV:
                 continue
 
@@ -129,6 +137,7 @@ async def check_sport(channel, sport_key, sport_name):
             if bet_key in posted_bets:
                 continue
 
+            units = staking_units(ev)
             if units <= 0:
                 continue
 
@@ -148,11 +157,13 @@ async def check_sport(channel, sport_key, sport_name):
                 f"📊 **EV:** {round(ev*100,2)}%\n"
                 f"📈 **Stake:** {units} units\n"
                 f"⏱ Starts in: {round(hrs_to_start,1)}h\n\n"
+                f"{line_movement_note}"
                 f"📚 **Other Books:**\n{sup_text}"
             )
 
             await channel.send(msg)
 
+# ===== LOOP =====
 async def ev_loop():
     await client.wait_until_ready()
     channel = client.get_channel(CHANNEL_ID)
