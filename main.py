@@ -20,6 +20,15 @@ CHECK_INTERVAL = 900    # 15 minutes
 # Trusted sharp AU bookmakers for EV calculations
 TRUSTED_BOOKS = ["Sportsbet", "PointsBet", "TAB", "Neds", "Betfair AU"]
 
+# Markets per sport
+SPORT_MARKETS = {
+    "americanfootball_nfl": ["h2h", "touchdown_scorer", "totals", "spreads"],
+    "australianfootball_afl": [],  # empty = fetch all markets
+    "rugbyleague_nrl": ["h2h", "tryscorer"],
+    "soccer_epl": ["h2h", "totals", "first_goal", "anytime_goal_scorer"],
+    "soccer_uefa_champs_league": ["h2h", "totals", "first_goal", "anytime_goal_scorer"]
+}
+
 SPORTS = {
     "americanfootball_nfl": "🏈 NFL",
     "australianfootball_afl": "🏉 AFL",
@@ -34,7 +43,7 @@ client = discord.Client(intents=intents)
 
 # ===== MEMORY =====
 posted_bets = set()        # Prevent duplicate alerts
-last_odds = {}             # Track line movement: {game-team-book: last_price}
+last_odds = {}             # Track line movement: {game-market-outcome-book: last_price}
 
 # ===== HELPERS =====
 def calc_ev(book_odds, true_prob):
@@ -56,11 +65,14 @@ def hours_until_start(commence_time):
 
 # ===== CORE LOGIC =====
 async def check_sport(channel, sport_key, sport_name):
+    markets = SPORT_MARKETS.get(sport_key)
+    markets_param = ",".join(markets) if markets else ""  # empty fetches all
+
     url = (
         f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
         f"?apiKey={ODDS_API_KEY}"
         f"&regions={REGION}"
-        f"&markets=h2h"
+        f"&markets={markets_param}"
         f"&oddsFormat={ODDS_FORMAT}"
     )
 
@@ -76,97 +88,103 @@ async def check_sport(channel, sport_key, sport_name):
 
     for game in games:
         game_id = game["id"]
-        home = game["home_team"]
-        away = game["away_team"]
+        home = game.get("home_team", "N/A")
+        away = game.get("away_team", "N/A")
         hrs_to_start = hours_until_start(game["commence_time"])
-
         books = game.get("bookmakers", [])
         if len(books) < 2:
             continue
 
-        for outcome_idx in [0, 1]:
-            team = books[0]["markets"][0]["outcomes"][outcome_idx]["name"]
+        for market_idx, market in enumerate(books[0]["markets"]):
+            market_name = market.get("key", "Market")
+            for outcome_idx, outcome in enumerate(market.get("outcomes", [])):
+                outcome_name = outcome["name"]
 
-            # ----- REFERENCE ODDS (TRUSTED BOOKS ONLY) -----
-            ref_prices = [
-                b["markets"][0]["outcomes"][outcome_idx]["price"]
-                for b in books if b["title"] in TRUSTED_BOOKS
-            ]
+                # ----- REFERENCE ODDS (TRUSTED BOOKS ONLY) -----
+                ref_prices = []
+                for b in books:
+                    if b["title"] in TRUSTED_BOOKS:
+                        try:
+                            ref_price = next(
+                                o["price"] for o in b["markets"][market_idx]["outcomes"]
+                                if o["name"] == outcome_name
+                            )
+                            ref_prices.append(ref_price)
+                        except:
+                            continue
 
-            if len(ref_prices) < 2:
-                continue  # need multiple sharp books to calculate EV
-
-            # Weighted true probability
-            true_prob = sum(1 / p for p in ref_prices) / len(ref_prices)
-
-            # Filter out extreme outliers (>15% higher than min ref)
-            if max(ref_prices) / min(ref_prices) > 1.15:
-                continue
-
-            # ----- BEST BOOK & LINE MOVEMENT -----
-            best_price = 0
-            best_book = None
-            supplementary = []
-            line_movement_note = ""
-
-            for b in books:
-                try:
-                    price = b["markets"][0]["outcomes"][outcome_idx]["price"]
-                    key = f"{game_id}-{team}-{b['title']}"
-
-                    # Detect line movement
-                    prev_price = last_odds.get(key)
-                    if prev_price and prev_price != price:
-                        line_movement_note += f"📈 {b['title']} moved: {prev_price} → {price}\n"
-                    last_odds[key] = price
-
-                    # Determine best odds
-                    if price > best_price:
-                        if best_book:
-                            supplementary.append((best_book["title"], best_price))
-                        best_price = price
-                        best_book = b
-                    else:
-                        supplementary.append((b["title"], price))
-                except:
+                if len(ref_prices) < 2:
                     continue
 
-            # ----- EV & FILTERS -----
-            ev = calc_ev(best_price, true_prob)
-            if ev < MIN_EV:
-                continue
-            if hrs_to_start > MAX_HOURS_TO_START and ev < MAJOR_EV:
-                continue
+                true_prob = sum(1 / p for p in ref_prices) / len(ref_prices)
+                if max(ref_prices)/min(ref_prices) > 1.15:
+                    continue  # filter out outliers
 
-            bet_key = f"{game_id}-{team}"
-            if bet_key in posted_bets:
-                continue
+                # ----- BEST BOOK & LINE MOVEMENT -----
+                best_price = 0
+                best_book = None
+                supplementary = []
+                line_movement_note = ""
 
-            units = staking_units(ev)
-            if units <= 0:
-                continue
+                for b in books:
+                    try:
+                        price = next(
+                            o["price"] for o in b["markets"][market_idx]["outcomes"]
+                            if o["name"] == outcome_name
+                        )
+                        key = f"{game_id}-{market_name}-{outcome_name}-{b['title']}"
+                        prev_price = last_odds.get(key)
+                        if prev_price and prev_price != price:
+                            line_movement_note += f"📈 {b['title']} moved: {prev_price} → {price}\n"
+                        last_odds[key] = price
 
-            posted_bets.add(bet_key)
+                        if price > best_price:
+                            if best_book:
+                                supplementary.append((best_book["title"], best_price))
+                            best_price = price
+                            best_book = b
+                        else:
+                            supplementary.append((b["title"], price))
+                    except:
+                        continue
 
-            # ----- FORMAT MESSAGE -----
-            sup_text = ""
-            for book, price in sorted(supplementary, key=lambda x: -x[1])[:4]:
-                sup_text += f"• {book}: {price}\n"
+                # ----- EV & FILTERS -----
+                ev = calc_ev(best_price, true_prob)
+                if ev < MIN_EV:
+                    continue
+                if hrs_to_start > MAX_HOURS_TO_START and ev < MAJOR_EV:
+                    continue
 
-            msg = (
-                f"🔥 **+EV BET** 🔥\n\n"
-                f"{sport_name}\n"
-                f"🆚 {away} vs {home}\n"
-                f"📌 **{team} ML**\n\n"
-                f"🏆 **Best Odds:** {best_price} ({best_book['title']})\n"
-                f"📊 **EV:** {round(ev*100,2)}%\n"
-                f"📈 **Stake:** {units} units\n"
-                f"⏱ Starts in: {round(hrs_to_start,1)}h\n\n"
-                f"{line_movement_note}"
-                f"📚 **Other Books:**\n{sup_text}"
-            )
+                bet_key = f"{game_id}-{market_name}-{outcome_name}"
+                if bet_key in posted_bets:
+                    continue
 
-            await channel.send(msg)
+                units = staking_units(ev)
+                if units <= 0:
+                    continue
+
+                posted_bets.add(bet_key)
+
+                # ----- FORMAT MESSAGE -----
+                sup_text = ""
+                for book, price in sorted(supplementary, key=lambda x: -x[1])[:4]:
+                    sup_text += f"• {book}: {price}\n"
+
+                msg = (
+                    f"🔥 **+EV BET** 🔥\n\n"
+                    f"{sport_name}\n"
+                    f"Market: **{market_name}**\n"
+                    f"🆚 {away} vs {home}\n"
+                    f"📌 **{outcome_name}**\n\n"
+                    f"🏆 **Best Odds:** {best_price} ({best_book['title']})\n"
+                    f"📊 **EV:** {round(ev*100,2)}%\n"
+                    f"📈 **Stake:** {units} units\n"
+                    f"⏱ Starts in: {round(hrs_to_start,1)}h\n\n"
+                    f"{line_movement_note}"
+                    f"📚 **Other Books:**\n{sup_text}"
+                )
+
+                await channel.send(msg)
 
 # ===== LOOP =====
 async def ev_loop():
