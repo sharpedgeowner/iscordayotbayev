@@ -12,11 +12,13 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 # ===== CONFIG =====
 REGION = "au"
 ODDS_FORMAT = "decimal"
-MIN_EV = 0.03           # +3% minimum
-MAX_EV = 0.10           # cap EV at 10%
+MIN_EV = 0.03           # +3% minimum EV to alert
 MAJOR_EV = 0.08         # overrides kickoff window
 MAX_HOURS_TO_START = 24
 CHECK_INTERVAL = 900    # 15 minutes
+
+# Trusted sharp AU bookmakers for EV calculations
+TRUSTED_BOOKS = ["Sportsbet", "PointsBet", "TAB", "Neds", "Betfair AU"]
 
 SPORTS = {
     "americanfootball_nfl": "🏈 NFL",
@@ -30,24 +32,22 @@ SPORTS = {
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
-# ===== MEMORY (ANTI-SPAM + LINE MOVEMENT) =====
-posted_bets = set()
-last_odds = {}  # key: game-team-book, value: last seen odds
+# ===== MEMORY =====
+posted_bets = set()        # Prevent duplicate alerts
+last_odds = {}             # Track line movement: {game-team-book: last_price}
 
 # ===== HELPERS =====
-def calc_ev(decimal_odds, true_prob):
-    ev = (true_prob * decimal_odds) - 1
-    return min(ev, MAX_EV)  # cap EV at 10%
+def calc_ev(book_odds, true_prob):
+    return (book_odds * true_prob) - 1
 
 def staking_units(ev):
-    # Fewer bets, higher conviction
     if ev >= 0.08:
         return 3.0
     elif ev >= 0.06:
         return 2.0
     elif ev >= 0.04:
         return 1.0
-    return 0.5  # minimum stake
+    return 0.5
 
 def hours_until_start(commence_time):
     start = datetime.fromisoformat(commence_time.replace("Z", "+00:00"))
@@ -64,12 +64,15 @@ async def check_sport(channel, sport_key, sport_name):
         f"&oddsFormat={ODDS_FORMAT}"
     )
 
-    res = requests.get(url)
-    if res.status_code != 200:
-        print(f"Odds API error for {sport_name}: {res.status_code}")
+    try:
+        res = requests.get(url, timeout=10)
+        if res.status_code != 200:
+            print(f"Odds API error {sport_name}: {res.status_code}")
+            return
+        games = res.json()
+    except Exception as e:
+        print(f"Error fetching {sport_name}: {e}")
         return
-
-    games = res.json()
 
     for game in games:
         game_id = game["id"]
@@ -84,20 +87,23 @@ async def check_sport(channel, sport_key, sport_name):
         for outcome_idx in [0, 1]:
             team = books[0]["markets"][0]["outcomes"][outcome_idx]["name"]
 
-            # ===== TRUE ODDS (AVG PROXY) =====
-            ref_prices = []
-            for b in books:
-                try:
-                    ref_prices.append(b["markets"][0]["outcomes"][outcome_idx]["price"])
-                except:
-                    pass
+            # ----- REFERENCE ODDS (TRUSTED BOOKS ONLY) -----
+            ref_prices = [
+                b["markets"][0]["outcomes"][outcome_idx]["price"]
+                for b in books if b["title"] in TRUSTED_BOOKS
+            ]
 
             if len(ref_prices) < 2:
-                continue
+                continue  # need multiple sharp books to calculate EV
 
+            # Weighted true probability
             true_prob = sum(1 / p for p in ref_prices) / len(ref_prices)
 
-            # ===== BEST BOOK + LINE MOVEMENT =====
+            # Filter out extreme outliers (>15% higher than min ref)
+            if max(ref_prices) / min(ref_prices) > 1.15:
+                continue
+
+            # ----- BEST BOOK & LINE MOVEMENT -----
             best_price = 0
             best_book = None
             supplementary = []
@@ -112,8 +118,7 @@ async def check_sport(channel, sport_key, sport_name):
                     prev_price = last_odds.get(key)
                     if prev_price and prev_price != price:
                         line_movement_note += f"📈 {b['title']} moved: {prev_price} → {price}\n"
-
-                    last_odds[key] = price  # update last seen
+                    last_odds[key] = price
 
                     # Determine best odds
                     if price > best_price:
@@ -126,10 +131,10 @@ async def check_sport(channel, sport_key, sport_name):
                 except:
                     continue
 
+            # ----- EV & FILTERS -----
             ev = calc_ev(best_price, true_prob)
             if ev < MIN_EV:
                 continue
-
             if hrs_to_start > MAX_HOURS_TO_START and ev < MAJOR_EV:
                 continue
 
@@ -143,7 +148,7 @@ async def check_sport(channel, sport_key, sport_name):
 
             posted_bets.add(bet_key)
 
-            # ===== FORMAT MESSAGE =====
+            # ----- FORMAT MESSAGE -----
             sup_text = ""
             for book, price in sorted(supplementary, key=lambda x: -x[1])[:4]:
                 sup_text += f"• {book}: {price}\n"
