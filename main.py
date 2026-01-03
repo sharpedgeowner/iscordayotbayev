@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS bets (
     ev REAL,
     result TEXT,
     placed_at TEXT,
-    settled_at TEXT
+    settled_at TEXT,
+    posted INTEGER DEFAULT 0
 )
 """)
 conn.commit()
@@ -60,8 +61,6 @@ conn.commit()
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
-
-posted_bets = set()
 
 # ================= HELPERS =================
 def hours_until_start(commence):
@@ -86,7 +85,7 @@ def format_game(game):
 def log_bet(bet_id, sport, game, market, pick, odds, stake, ev):
     c.execute("""
     INSERT OR IGNORE INTO bets
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, 0)
     """, (
         bet_id, sport, game, market, pick, odds, stake, ev, datetime.now(timezone.utc).isoformat()
     ))
@@ -154,47 +153,39 @@ async def check_sport(channel, sport_key, cfg):
             for outcome in books[0]["markets"][0]["outcomes"]:
                 name = outcome["name"]
 
-                ref_prices = []
+                # Get all prices from trusted books
+                prices = []
                 for b in books:
                     if b["title"] in TRUSTED_BOOKS:
                         try:
                             price = next(
-                                o["price"]
-                                for o in b["markets"][0]["outcomes"]
-                                if o["name"] == name
+                                o["price"] for o in b["markets"][0]["outcomes"] if o["name"] == name
                             )
-                            ref_prices.append(price)
+                            prices.append((price, b["title"]))
                         except:
                             pass
 
-                if len(ref_prices) < 2:
+                if len(prices) < 2:
                     continue
 
-                true_prob = sum(1/p for p in ref_prices) / len(ref_prices)
+                # Compute true probability
+                true_prob = sum(1/p[0] for p in prices) / len(prices)
 
-                best_price = 0
-                best_book = None
-                for b in books:
-                    try:
-                        price = next(
-                            o["price"]
-                            for o in b["markets"][0]["outcomes"]
-                            if o["name"] == name
-                        )
-                        if price > best_price:
-                            best_price = price
-                            best_book = b["title"]
-                    except:
-                        pass
+                # Pick the highest odds across all books
+                best_price, best_book = max(prices, key=lambda x: x[0])
 
+                # Calculate EV
                 ev = calc_ev(best_price, true_prob)
                 if ev < MIN_EV:
                     continue
 
                 bet_id = f"{game['id']}-{market}-{name}"
-                if bet_id in posted_bets:
-                    continue
-                posted_bets.add(bet_id)
+
+                # Check DB if already posted
+                c.execute("SELECT posted FROM bets WHERE id=?", (bet_id,))
+                row = c.fetchone()
+                if row and row[0] == 1:
+                    continue  # already posted
 
                 units = staking(ev)
 
@@ -210,7 +201,11 @@ async def check_sport(channel, sport_key, cfg):
                 )
 
                 await channel.send(msg)
-                log_bet(bet_id, cfg["name"], game_line, market, name, best_price, units, ev)
+
+                # Log bet and mark as posted
+                log_bet(bet_id, cfg['name'], game_line, market, name, best_price, units, ev)
+                c.execute("UPDATE bets SET posted=1 WHERE id=?", (bet_id,))
+                conn.commit()
 
 # ================= AUTO-SETTLEMENT =================
 async def auto_settle():
@@ -221,7 +216,7 @@ async def auto_settle():
         unsettled = c.fetchall()
 
         for bet_id, sport, market, pick in unsettled:
-            # Check finished games from the odds API
+            # Check finished games from API
             url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds?apiKey={ODDS_API_KEY}&regions={REGION}&markets={market}&oddsFormat={ODDS_FORMAT}"
             try:
                 r = requests.get(url, timeout=10)
@@ -232,7 +227,6 @@ async def auto_settle():
                 continue
 
             for game in games:
-                # Only settle if game finished
                 if not game.get("completed", False):
                     continue
 
@@ -240,11 +234,9 @@ async def auto_settle():
                 if not books:
                     continue
 
-                # Determine actual winner from first bookmaker (trusted)
                 outcomes = books[0]["markets"][0]["outcomes"]
-                actual_winner = max(outcomes, key=lambda x: x["price"])["name"]  # simplification
-
-                # Settle the bet
+                # Simplified settlement: pick the winner
+                actual_winner = max(outcomes, key=lambda x: x["price"])["name"]
                 result = "win" if pick == actual_winner else "loss"
                 settle_bet(bet_id, result)
 
