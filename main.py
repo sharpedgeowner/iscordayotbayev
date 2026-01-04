@@ -7,14 +7,14 @@ from datetime import datetime, timezone, timedelta
 
 # ================= ENV =================
 TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID"))              # Betting channel
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 RESULTS_CHANNEL_ID = int(os.getenv("RESULTS_CHANNEL_ID"))
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 # ================= CONFIG =================
 REGION = "au"
 ODDS_FORMAT = "decimal"
-CHECK_INTERVAL = 900
+CHECK_INTERVAL = 1800  # safer for rate limits
 MIN_EV = 0.03
 MAX_HOURS_TO_START = 24
 
@@ -67,9 +67,9 @@ def staking(ev):
     if ev >= 0.04: return 1
     return 0.5
 
-def discord_time(iso_time):
-    dt = datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
-    return f"<t:{int(dt.timestamp())}:F>"
+def discord_time(iso):
+    ts = int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
+    return f"<t:{ts}:F>"
 
 def log_bet(bet_id, sport, game, market, pick, odds, stake, ev):
     c.execute("""
@@ -101,7 +101,7 @@ def roi_since(start):
         staked += stake
         profit += (odds - 1) * stake if result == "win" else -stake
 
-    roi = (profit / staked * 100) if staked > 0 else 0
+    roi = (profit / staked * 100) if staked else 0
     return round(profit, 2), round(roi, 2)
 
 # ================= CORE =================
@@ -114,11 +114,20 @@ async def check_sport(channel, sport_key, cfg):
         )
 
         try:
-            games = requests.get(url, timeout=10).json()
-        except:
+            r = requests.get(url, timeout=10)
+            if r.status_code != 200:
+                continue
+            games = r.json()
+            if not isinstance(games, list):
+                continue
+        except Exception as e:
+            print("Odds API error:", e)
             continue
 
         for game in games:
+            if not isinstance(game, dict):
+                continue
+
             if hours_until_start(game["commence_time"]) > MAX_HOURS_TO_START:
                 continue
 
@@ -154,13 +163,12 @@ async def check_sport(channel, sport_key, cfg):
                     continue
 
                 units = staking(ev)
-                game_time = discord_time(game["commence_time"])
 
                 msg = (
                     f"🔥 **+EV BET** 🔥\n\n"
                     f"{cfg['name']}\n"
                     f"**Game:** {game['away_team']} @ {game['home_team']}\n"
-                    f"**Start:** {game_time}\n"
+                    f"**Start:** {discord_time(game['commence_time'])}\n"
                     f"**Pick:** {name}\n"
                     f"**Odds:** {best_price} ({best_book})\n"
                     f"**EV:** {round(ev*100,2)}%\n"
@@ -173,7 +181,7 @@ async def check_sport(channel, sport_key, cfg):
                 c.execute("UPDATE bets SET posted=1 WHERE id=?", (bet_id,))
                 conn.commit()
 
-# ================= AUTO-SETTLE (H2H ONLY) =================
+# ================= AUTO SETTLE (H2H ONLY) =================
 async def auto_settle():
     await client.wait_until_ready()
 
@@ -187,8 +195,14 @@ async def auto_settle():
 
         for bet_id, sport, pick in unsettled:
             url = f"https://api.the-odds-api.com/v4/sports/{sport}/scores?apiKey={ODDS_API_KEY}&daysFrom=2"
+
             try:
-                games = requests.get(url, timeout=10).json()
+                r = requests.get(url, timeout=10)
+                if r.status_code != 200:
+                    continue
+                games = r.json()
+                if not isinstance(games, list):
+                    continue
             except:
                 continue
 
@@ -200,8 +214,7 @@ async def auto_settle():
                 if not scores:
                     continue
 
-                home, away = game["home_team"], game["away_team"]
-                winner = home if scores[0]["score"] > scores[1]["score"] else away
+                winner = game["home_team"] if scores[0]["score"] > scores[1]["score"] else game["away_team"]
                 settle_bet(bet_id, "win" if pick == winner else "loss")
 
         await asyncio.sleep(3600)
@@ -227,7 +240,6 @@ async def on_ready():
 async def on_message(message):
     if message.author == client.user:
         return
-
     if message.channel.id != RESULTS_CHANNEL_ID:
         return
 
