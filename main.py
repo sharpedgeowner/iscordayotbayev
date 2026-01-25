@@ -3,22 +3,19 @@ import os
 import asyncio
 import requests
 import sqlite3
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 # ================= ENV =================
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
-RESULTS_CHANNEL_ID = int(os.getenv("RESULTS_CHANNEL_ID"))
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
 # ================= CONFIG =================
 REGION = "au"
 ODDS_FORMAT = "decimal"
-CHECK_INTERVAL = 1800
-MIN_EV = 0.03
-MAX_HOURS_TO_START = 24
-
-TRUSTED_BOOKS = ["Sportsbet", "PointsBet", "TAB", "Neds", "Betfair AU"]
+CHECK_INTERVAL = 1800  # 30 mins
+MIN_EV = 0.02          # relaxed so it actually posts
+MAX_HOURS_TO_START = 168  # 7 days
 
 SPORTS = {
     "americanfootball_nfl": "🏈 NFL",
@@ -34,24 +31,19 @@ c.execute("""
 CREATE TABLE IF NOT EXISTS bets (
     id TEXT PRIMARY KEY,
     sport TEXT,
-    game TEXT,
-    market TEXT,
     pick TEXT,
     odds REAL,
-    stake REAL,
     ev REAL,
-    result TEXT,
-    placed_at TEXT,
-    settled_at TEXT,
-    posted INTEGER
+    placed_at TEXT
 )
 """)
 conn.commit()
 
 # ================= DISCORD =================
 intents = discord.Intents.default()
-intents.message_content = True
 client = discord.Client(intents=intents)
+
+status_message = None  # single updating status message
 
 # ================= HELPERS =================
 def hours_until_start(commence):
@@ -61,47 +53,25 @@ def hours_until_start(commence):
 def calc_ev(price, true_prob):
     return (price * true_prob) - 1
 
-def stake(ev):
-    if ev >= 0.08: return 3
-    if ev >= 0.06: return 2
-    if ev >= 0.04: return 1
-    return 0.5
-
-def log_bet(bet_id, sport, game, market, pick, odds, units, ev):
-    c.execute("""
-    INSERT OR IGNORE INTO bets
-    (id, sport, game, market, pick, odds, stake, ev, placed_at, posted)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-    """, (
-        bet_id, sport, game, market, pick,
-        odds, units, ev,
-        datetime.now(timezone.utc).isoformat()
-    ))
-    conn.commit()
-
-def settle_bet(bet_id, result):
-    c.execute("""
-    UPDATE bets SET result=?, settled_at=?
-    WHERE id=?
-    """, (result, datetime.now(timezone.utc).isoformat(), bet_id))
-    conn.commit()
-
 # ================= CORE =================
 async def check_sport(channel, sport_key, sport_name):
+    found_bet = False
+
     url = (
         f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-        f"?apiKey={ODDS_API_KEY}&regions={REGION}"
-        f"&markets=h2h&oddsFormat={ODDS_FORMAT}"
+        f"?apiKey={ODDS_API_KEY}"
+        f"&regions={REGION}"
+        f"&markets=h2h"
+        f"&oddsFormat={ODDS_FORMAT}"
     )
-
 
     try:
         r = requests.get(url, timeout=10)
         if r.status_code != 200:
-            return
+            return False
         games = r.json()
     except:
-        return
+        return False
 
     for game in games:
         if hours_until_start(game["commence_time"]) > MAX_HOURS_TO_START:
@@ -118,110 +88,88 @@ async def check_sport(channel, sport_key, sport_name):
             prices = []
 
             for b in books:
-                if b["title"] in TRUSTED_BOOKS:
-                    try:
-                        price = next(o["price"] for o in b["markets"][0]["outcomes"] if o["name"] == name)
-                        prices.append(price)
-                    except:
-                        pass
+                try:
+                    price = next(
+                        o["price"] for o in b["markets"][0]["outcomes"]
+                        if o["name"] == name
+                    )
+                    prices.append(price)
+                except:
+                    continue
 
             if len(prices) < 2:
                 continue
 
-            inv = [1/p for p in prices]
-            true_prob = sum(inv) / len(inv)
-            true_prob = true_prob / (1 + (sum(inv) - 1))
-
+            true_prob = sum(1 / p for p in prices) / len(prices)
             best_price = max(prices)
             ev = calc_ev(best_price, true_prob)
 
             if ev < MIN_EV:
                 continue
 
-            bet_id = f"{game['id']}-h2h-{name}"
-            c.execute("SELECT posted FROM bets WHERE id=?", (bet_id,))
-            row = c.fetchone()
-            if row and row[0] == 1:
+            bet_id = f"{game['id']}-{name}"
+            c.execute("SELECT 1 FROM bets WHERE id=?", (bet_id,))
+            if c.fetchone():
                 continue
 
-            units = stake(ev)
-
             msg = (
-                f"🔥 **+EV BET** 🔥\n\n"
+                f"🔥 **+EV BET FOUND** 🔥\n\n"
                 f"{sport_name}\n"
-                f"**{game['away_team']} @ {game['home_team']}**\n"
-                f"**Pick:** {name}\n"
-                f"**Odds:** {best_price}\n"
-                f"**EV:** {round(ev*100,2)}%\n"
-                f"**Stake:** {units} units"
+                f"🆚 {game['away_team']} @ {game['home_team']}\n"
+                f"🎯 **Pick:** {name}\n"
+                f"💰 **Odds:** {best_price}\n"
+                f"📊 **EV:** {round(ev*100,2)}%\n"
             )
 
             await channel.send(msg)
-            log_bet(bet_id, sport_key, game["id"], "h2h", name, best_price, units, ev)
 
-# ================= AUTO SETTLE =================
-async def auto_settle():
-    await client.wait_until_ready()
+            c.execute(
+                "INSERT INTO bets VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    bet_id,
+                    sport_key,
+                    name,
+                    best_price,
+                    ev,
+                    datetime.now(timezone.utc).isoformat()
+                )
+            )
+            conn.commit()
 
-    while True:
-        c.execute("""
-        SELECT id, sport, pick
-        FROM bets
-        WHERE result IS NULL
-        """)
-        bets = c.fetchall()
+            found_bet = True
 
-        for bet_id, sport, pick in bets:
-            url = f"https://api.the-odds-api.com/v4/sports/{sport}/scores?apiKey={ODDS_API_KEY}&daysFrom=2"
-
-            try:
-                r = requests.get(url, timeout=10)
-                games = r.json()
-            except:
-                continue
-
-            for game in games:
-                if not game.get("completed"):
-                    continue
-
-                scores = {s["name"]: s["score"] for s in game.get("scores", [])}
-                if not scores:
-                    continue
-
-                winner = max(scores, key=scores.get)
-                settle_bet(bet_id, "win" if pick == winner else "loss")
-
-        await asyncio.sleep(3600)
+    return found_bet
 
 # ================= EVENTS =================
 @client.event
 async def on_ready():
     print("Bot online")
+
     channel = client.get_channel(CHANNEL_ID)
-    client.loop.create_task(auto_settle())
+    global status_message
+
+    status_message = await channel.send("🔍 Searching for +EV bets...")
 
     while True:
-        for sport, name in SPORTS.items():
-            await check_sport(channel, sport, name)
+        found_any = False
+
+        for sport_key, sport_name in SPORTS.items():
+            found = await check_sport(channel, sport_key, sport_name)
+            if found:
+                found_any = True
+
+        now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+        if status_message:
+            if found_any:
+                await status_message.edit(
+                    content=f"✅ Bets found this cycle\nLast check: {now}"
+                )
+            else:
+                await status_message.edit(
+                    content=f"🔍 Searching for +EV bets...\nLast check: {now}"
+                )
+
         await asyncio.sleep(CHECK_INTERVAL)
-
-@client.event
-async def on_message(message):
-    if message.author == client.user:
-        return
-    if message.channel.id != RESULTS_CHANNEL_ID:
-        return
-
-    if message.content.lower() == "?results":
-        c.execute("SELECT odds, stake, result FROM bets WHERE result IS NOT NULL")
-        rows = c.fetchall()
-
-        profit, staked = 0, 0
-        for odds, stake, result in rows:
-            staked += stake
-            profit += (odds - 1) * stake if result == "win" else -stake
-
-        roi = round((profit / staked) * 100, 2) if staked else 0
-        await message.channel.send(f"📊 **ROI:** {profit:+.2f}u | {roi}%")
 
 client.run(TOKEN)
