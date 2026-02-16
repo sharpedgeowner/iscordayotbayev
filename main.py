@@ -33,6 +33,9 @@ SPORTS = {
         "name": "⚽ EPL",
         "markets": ["h2h", "totals"]
     }
+    "rugbyleague_nrl": {
+        "name": "🏉 NRL",
+        "markets": ["h2h", "totals", "anytime_tryscorers"]
 }
 
 # ================= DATABASE =================
