@@ -37,6 +37,7 @@ SPORTS = {
         "name": "🏉 NRL",
         "markets": ["h2h", "totals", "anytime_tryscorers"]
 }
+}
 
 # ================= DATABASE =================
 conn = sqlite3.connect("bets.db", check_same_thread=False)
