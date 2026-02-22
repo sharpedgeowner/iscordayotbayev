@@ -4,200 +4,192 @@ import asyncio
 import requests
 from datetime import datetime, timezone
 
-# ================= ENV =================
+# ================= CONFIG =================
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
 
-# ================= CONFIG =================
 REGION = "au"
 ODDS_FORMAT = "decimal"
-CHECK_INTERVAL = 1800
-MIN_EV = 0.02
-MAX_HOURS_TO_START = 72
+EV_CAP = 0.10
+CHECK_INTERVAL = 1800  # 30 mins
 
-TRUSTED_BOOKS = ["Sportsbet", "PointsBet", "TAB", "Neds", "Betfair AU"]
+SPORTS = [
+    "americanfootball_nfl",
+    "aussierules_afl",
+    "rugby_league_nrl",
+    "basketball_nba",
+    "soccer_epl"
+]
 
-SPORTS = {
-    "americanfootball_nfl": {
-        "name": "🏈 NFL",
-        "markets": ["h2h", "spreads", "totals", "player_anytime_td"]
-    },
-    "basketball_nba": {
-        "name": "🏀 NBA",
-        "markets": ["h2h", "spreads", "totals", "player_points"]
-    },
-    "soccer_epl": {
-        "name": "⚽ EPL",
-        "markets": ["h2h", "totals", "btts", "player_goal_scorer"]
-    },
-    "rugbyleague_nrl": {
-        "name": "🏉 NRL",
-        "markets": ["h2h", "spreads", "totals"]
-    },
-    "australianfootball_afl": {
-        "name": "🏉 AFL",
-        "markets": ["h2h", "spreads", "totals"]
-    }
-}
+MARKETS = [
+    "h2h",
+    "spreads",
+    "totals",
+    "player_points",
+    "player_pass_tds",
+    "player_anytime_td",
+    "player_goals"
+]
 
-# ================= DISCORD =================
+# ==========================================
+
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
 posted_bets = set()
-status_message = None
 
-# ================= HELPERS =================
+# ================= TIME FUNCTIONS =================
 
-def hours_until_start(commence):
-    start = datetime.fromisoformat(commence.replace("Z", "+00:00"))
-    return (start - datetime.now(timezone.utc)).total_seconds() / 3600
+def discord_timestamp(iso_time):
+    dt = datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
+    unix = int(dt.timestamp())
+    return f"<t:{unix}:F>"
 
-def calc_ev(price, true_prob):
-    return (price * true_prob) - 1
+def discord_relative(iso_time):
+    dt = datetime.fromisoformat(iso_time.replace("Z", "+00:00"))
+    unix = int(dt.timestamp())
+    return f"<t:{unix}:R>"
 
-def staking(ev):
-    if ev >= 0.08: return 3
-    if ev >= 0.05: return 2
-    if ev >= 0.03: return 1
-    return 0.5
+# ================= STAKING =================
 
-def discord_time(iso):
-    ts = int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
-    return f"<t:{ts}:F>"
+def calculate_units(ev):
+    if ev >= 0.09:
+        return 3
+    elif ev >= 0.07:
+        return 2
+    elif ev >= 0.05:
+        return 1
+    else:
+        return 0.5
 
-# ================= CORE =================
+# ================= EV CHECK =================
 
-async def check_sport(channel, sport_key, config):
+def calculate_ev(best_price, sharp_price):
+    if sharp_price == 0:
+        return 0
+    fair_prob = 1 / sharp_price
+    ev = (best_price * fair_prob) - 1
+    return ev
 
-    markets_param = ",".join(config["markets"])
+# ================= MAIN LOGIC =================
 
-    url = (
-        f"https://api.the-odds-api.com/v4/sports/{sport_key}/odds"
-        f"?apiKey={ODDS_API_KEY}"
-        f"&regions={REGION}"
-        f"&markets={markets_param}"
-        f"&oddsFormat={ODDS_FORMAT}"
-    )
-
+async def check_sport(channel, sport):
     try:
-        r = requests.get(url, timeout=10)
+        url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds"
+        params = {
+            "apiKey": ODDS_API_KEY,
+            "regions": REGION,
+            "markets": ",".join(MARKETS),
+            "oddsFormat": ODDS_FORMAT
+        }
+
+        r = requests.get(url, params=params)
+
         if r.status_code != 200:
-            print(f"{sport_key} API error:", r.status_code)
+            print("API Error:", r.status_code, r.text)
             return
 
         games = r.json()
-        if not isinstance(games, list):
-            return
+
+        for game in games:
+
+            start_time = game["commence_time"]
+
+            # Only within 24 hours
+            game_time = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+            hours_to_start = (game_time - datetime.now(timezone.utc)).total_seconds() / 3600
+
+            if hours_to_start > 24:
+                continue
+
+            bookmakers = game.get("bookmakers", [])
+            if not bookmakers:
+                continue
+
+            for market in MARKETS:
+                prices = []
+                for book in bookmakers:
+                    for m in book.get("markets", []):
+                        if m["key"] == market:
+                            for outcome in m["outcomes"]:
+                                prices.append({
+                                    "book": book["title"],
+                                    "name": outcome["name"],
+                                    "price": outcome["price"]
+                                })
+
+                if len(prices) < 2:
+                    continue
+
+                best = max(prices, key=lambda x: x["price"])
+
+                # Use average as synthetic sharp price
+                avg_price = sum(p["price"] for p in prices) / len(prices)
+
+                ev = calculate_ev(best["price"], avg_price)
+
+                if ev <= 0 or ev > EV_CAP:
+                    continue
+
+                bet_id = f"{game['id']}_{market}_{best['name']}"
+                if bet_id in posted_bets:
+                    continue
+
+                units = calculate_units(ev)
+
+                supplementary = [
+                    f"{p['book']} {p['price']}"
+                    for p in prices
+                    if p["name"] == best["name"] and p["book"] != best["book"]
+                ]
+
+                message = f"""
+🔥 **Positive EV Bet Found**
+
+🏈 {game['home_team']} vs {game['away_team']}
+📊 Market: {market}
+🎯 Selection: {best['name']}
+💰 Best Price: {best['price']} @ {best['book']}
+📈 EV: {round(ev*100,2)}%
+📦 Stake: {units} Units
+
+🕒 Start: {discord_timestamp(start_time)} ({discord_relative(start_time)})
+
+📚 Other Books:
+{", ".join(supplementary) if supplementary else "None"}
+"""
+
+                await channel.send(message)
+                posted_bets.add(bet_id)
 
     except Exception as e:
-        print("Request failed:", e)
-        return
-
-    print(f"{config['name']} games:", len(games))
-
-    for game in games:
-
-        if hours_until_start(game["commence_time"]) > MAX_HOURS_TO_START:
-            continue
-
-        books = game.get("bookmakers", [])
-        if len(books) < 2:
-            continue
-
-        # Collect reference prices
-        reference = {}
-
-        for b in books:
-            if b["title"] not in TRUSTED_BOOKS:
-                continue
-
-            for market in b.get("markets", []):
-                key = market["key"]
-
-                for outcome in market.get("outcomes", []):
-                    ref_key = (key, outcome["name"])
-                    reference.setdefault(ref_key, []).append(outcome["price"])
-
-        for (market_key, outcome_name), prices in reference.items():
-
-            if len(prices) < 2:
-                continue
-
-            true_prob = sum(1/p for p in prices) / len(prices)
-
-            best_price = 0
-            best_book = None
-
-            for b in books:
-                for market in b.get("markets", []):
-                    if market["key"] != market_key:
-                        continue
-
-                    for outcome in market.get("outcomes", []):
-                        if outcome["name"] == outcome_name:
-                            if outcome["price"] > best_price:
-                                best_price = outcome["price"]
-                                best_book = b["title"]
-
-            if best_price == 0:
-                continue
-
-            ev = calc_ev(best_price, true_prob)
-
-            if ev < MIN_EV:
-                continue
-
-            bet_id = f"{game['id']}-{market_key}-{outcome_name}"
-            if bet_id in posted_bets:
-                continue
-
-            units = staking(ev)
-
-            msg = (
-                f"🔥 **+EV BET** 🔥\n\n"
-                f"{config['name']}\n"
-                f"Market: {market_key}\n"
-                f"Game: {game.get('away_team','')} @ {game.get('home_team','')}\n"
-                f"Start: {discord_time(game['commence_time'])}\n"
-                f"Pick: {outcome_name}\n"
-                f"Best Odds: {best_price} ({best_book})\n"
-                f"EV: {round(ev*100,2)}%\n"
-                f"Stake: {units} units"
-            )
-
-            await channel.send(msg)
-            posted_bets.add(bet_id)
-            print("Posted:", bet_id)
+        print("Error:", e)
 
 # ================= LOOP =================
 
-async def main_loop():
+async def ev_loop():
     await client.wait_until_ready()
     channel = client.get_channel(CHANNEL_ID)
 
-    global status_message
-    status_message = await channel.send("🔍 Searching for +EV bets...")
+    while not client.is_closed():
+        try:
+            now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+            await channel.send(f"🔍 Searching for EV bets... ({now})")
 
-    while True:
+            for sport in SPORTS:
+                await check_sport(channel, sport)
 
-        for sport_key, config in SPORTS.items():
-            await check_sport(channel, sport_key, config)
-
-        now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-
-        await status_message.edit(
-            content=f"🔍 Searching for +EV bets...\nLast check: {now}"
-        )
+        except Exception as e:
+            print("Loop Error:", e)
 
         await asyncio.sleep(CHECK_INTERVAL)
 
-# ================= EVENTS =================
+# ================= START =================
 
 @client.event
 async def on_ready():
-    print("Bot online")
-    client.loop.create_task(main_loop())
+    print(f"Logged in as {client.user}")
+    client.loop.create_task(ev_loop())
 
 client.run(TOKEN)
